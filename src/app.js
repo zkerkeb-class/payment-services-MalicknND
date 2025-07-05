@@ -3,9 +3,14 @@ const express = require("express");
 const app = express();
 const cors = require("cors");
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+const axios = require("axios");
 
 // Middleware CORS en premier
 app.use(cors());
+
+// Configuration pour l'API de crédits
+const CREDITS_API_URL =
+  process.env.CREDITS_API_URL || "http://localhost:9002/api/credits";
 
 // ⚠️ IMPORTANT: Webhook AVANT express.json() pour recevoir le raw body
 app.post(
@@ -25,14 +30,23 @@ app.post(
         const session = event.data.object;
         const { userId, creditPackage, credits } = session.metadata;
 
-        // TODO: Remplacer par une vraie base de données
-        const currentCredits = userCredits.get(userId) || 0;
-        const newCredits = currentCredits + parseInt(credits);
-        userCredits.set(userId, newCredits);
+        // Appeler l'API de crédits pour ajouter les crédits
+        try {
+          const response = await axios.post(`${CREDITS_API_URL}/add`, {
+            userId,
+            amount: parseInt(credits),
+          });
 
-        console.log(
-          `✅ Credits added for user ${userId}: ${credits} credits (total: ${newCredits})`
-        );
+          if (response.data.success) {
+            console.log(
+              `✅ Credits added for user ${userId}: ${credits} credits (total: ${response.data.data.totalCredits})`
+            );
+          } else {
+            console.error("❌ Failed to add credits:", response.data.error);
+          }
+        } catch (apiError) {
+          console.error("❌ Error calling credits API:", apiError.message);
+        }
       }
 
       res.json({ received: true });
@@ -57,80 +71,62 @@ if (!STRIPE_PRICE_100_CREDITS) {
   process.exit(1);
 }
 
-// ⚠️ TEMPORAIRE - Remplacer par une vraie base de données
-const userCredits = new Map();
+// Routes pour la gestion des crédits (proxy vers le service BDD)
+app.get("/api/credits/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
 
-// Routes pour la gestion des crédits
-app.get("/api/credits/:userId", (req, res) => {
-  const { userId } = req.params;
+    if (!userId) {
+      return res.status(400).json({
+        success: false,
+        error: "userId is required",
+      });
+    }
 
-  if (!userId) {
-    return res.status(400).json({
+    const response = await axios.get(`${CREDITS_API_URL}/${userId}`);
+    res.json(response.data);
+  } catch (error) {
+    console.error("❌ Error getting credits:", error.message);
+    res.status(500).json({
       success: false,
-      error: "userId is required",
+      error: "Failed to get credits",
+      details:
+        process.env.NODE_ENV === "development" ? error.message : undefined,
     });
   }
-
-  const credits = userCredits.get(userId) || 0;
-
-  res.json({
-    success: true,
-    data: {
-      userId,
-      credits,
-      canGenerate: credits > 0,
-    },
-  });
 });
 
-app.post("/api/credits/use", (req, res) => {
-  const { userId, amount = 1 } = req.body;
+app.post("/api/credits/use", async (req, res) => {
+  try {
+    const { userId, amount = 1 } = req.body;
 
-  if (!userId) {
-    return res.status(400).json({
-      success: false,
-      error: "userId is required",
-    });
-  }
+    if (!userId) {
+      return res.status(400).json({
+        success: false,
+        error: "userId is required",
+      });
+    }
 
-  if (amount < 1) {
-    return res.status(400).json({
-      success: false,
-      error: "Amount must be positive",
-    });
-  }
-
-  const currentCredits = userCredits.get(userId) || 0;
-
-  if (currentCredits < amount) {
-    return res.status(402).json({
-      success: false,
-      error: "Insufficient credits",
-      data: {
-        currentCredits,
-        requiredCredits: amount,
-        canGenerate: false,
-      },
-    });
-  }
-
-  // Déduire les crédits
-  const newCredits = currentCredits - amount;
-  userCredits.set(userId, newCredits);
-
-  console.log(
-    `💳 User ${userId} used ${amount} credits (remaining: ${newCredits})`
-  );
-
-  res.json({
-    success: true,
-    data: {
+    const response = await axios.post(`${CREDITS_API_URL}/use`, {
       userId,
-      creditsUsed: amount,
-      remainingCredits: newCredits,
-      canGenerate: newCredits > 0,
-    },
-  });
+      amount,
+    });
+
+    res.status(response.status).json(response.data);
+  } catch (error) {
+    if (error.response) {
+      // L'API a retourné une erreur
+      res.status(error.response.status).json(error.response.data);
+    } else {
+      console.error("❌ Error using credits:", error.message);
+      res.status(500).json({
+        success: false,
+        error: "Failed to use credits",
+        details:
+          process.env.NODE_ENV === "development" ? error.message : undefined,
+      });
+    }
+  }
 });
 
 // Route pour créer une session de paiement (seulement 100 crédits)
